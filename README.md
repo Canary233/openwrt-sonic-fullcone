@@ -12,7 +12,7 @@
 
 内核补丁在 conntrack 内部增加了第二张哈希表（`nat_by_manip_src`），以**转换后的 3-tuple**（协议、源 IP、源端口）为索引：
 
-- **SNAT 方向**：3-tuple 唯一性保证——同一个 (proto, src_ip, src_port) 不会被不同连接复用，实现端点无关映射（EIM）
+- **SNAT 方向**：3-tuple 唯一性保证——同一个 (proto, src_ip, src_port) 不会被不同连接复用，实现端点无关映射（EIM）。**这个保证只在 SNAT 规则带端口范围时生效**，fw4 生成的规则会自动带上，见[为什么 SNAT 规则带端口范围](#为什么-snat-规则带端口范围)
 - **DNAT 方向**：反向查找——入站数据包通过哈希表找到原始内部主机，实现端点无关过滤（EIF）
 - **全 L4 协议支持**：TCP、UDP、ICMP、GRE、SCTP、DCCP、UDPlite
 - **非 fullcone 流量零开销**：fullcone 标志位是 per-rule 的，不是全局的
@@ -136,6 +136,18 @@ config zone
     option fullcone '1'           # 此 zone 启用 fullcone
 ```
 
+生成的 nftables 规则：
+
+```nft
+chain srcnat_wan {
+    meta nfproto ipv4 meta l4proto { tcp, udp, sctp, dccp, udplite, icmp, gre } fullcone to :1024-65535
+    meta nfproto ipv4 fullcone                   # 其余协议
+}
+chain dstnat_wan {
+    meta nfproto ipv4 fullcone
+}
+```
+
 **仅 UDP**：
 
 ```
@@ -150,11 +162,11 @@ config zone
 
 ```nft
 chain srcnat_wan {
-    meta nfproto ipv4 meta l4proto udp fullcone  # UDP → fullcone
-    meta nfproto ipv4 masquerade                 # 其余 → 标准 masquerade
+    meta nfproto ipv4 meta l4proto udp fullcone to :1024-65535  # UDP → fullcone
+    meta nfproto ipv4 masquerade                                # 其余 → 标准 masquerade
 }
 chain dstnat_wan {
-    meta nfproto ipv4 meta l4proto udp fullcone  # 仅 UDP 反向映射
+    meta nfproto ipv4 meta l4proto udp fullcone                 # 仅 UDP 反向映射
 }
 ```
 
@@ -167,7 +179,7 @@ chain dstnat_wan {
 table inet fullcone-custom {
     chain srcnat {
         type nat hook postrouting priority srcnat + 1; policy accept;
-        oifname "eth1" ip saddr 192.168.1.0/24 meta l4proto udp fullcone
+        oifname "eth1" ip saddr 192.168.1.0/24 meta l4proto udp fullcone to :1024-65535
     }
     chain dstnat {
         type nat hook prerouting priority dstnat + 1; policy accept;
@@ -176,7 +188,30 @@ table inet fullcone-custom {
 }
 ```
 
-注意：使用自定义规则时，应关闭该 zone 的 fw4 fullcone 选项以避免冲突。
+注意：
+- 使用自定义规则时，应关闭该 zone 的 fw4 fullcone 选项以避免冲突。
+- **SNAT 一侧务必带端口范围**（`to :1024-65535`），否则 3-tuple 唯一性保证不生效，见下一节。DNAT 一侧不需要。
+
+### 为什么 SNAT 规则带端口范围
+
+fw4 给有端口（以及 ICMP id、GRE key）的协议生成的 SNAT 规则都带 `to :1024-65535`。这不是装饰——**不带它，3-tuple 唯一性保证根本不生效**。
+
+内核补丁是 SONiC 的原样移植，`get_unique_tuple()` 只在 `NF_NAT_RANGE_PROTO_SPECIFIED` 分支里做 3-tuple 检查；规则没有端口范围时，转换后的端口只经过普通的 5-tuple 检查就会被接受。SONiC 自己不会走到那条路径：它的 [natmgr](https://github.com/sonic-net/sonic-swss/blob/master/cfgmgr/natmgr.cpp) 只在配置了端口范围时才加 `--fullcone`。
+
+不带端口范围时的实际表现（两台内网主机都用本地 UDP 40000，分别访问不同的目标）：
+
+| | 不带范围 | 带 `to :1024-65535` |
+|---|---|---|
+| 主机 1 → 目标 A | 外部端口 40000 | 外部端口 40000 |
+| 主机 2 → 目标 B | 外部端口 **40000**，与主机 1 共用 | 另一个端口 |
+| 陌生来源 → 外部端口 40000 | 投给**主机 2** | 投给主机 1 |
+| 主机 1 → 目标 B | **另一个端口**，映射随目标变化 | 外部端口 40000 |
+
+先建立映射的主机丢了这个端口上的入站可达性，换个目标外部端口还会变——正好是全锥要避免的两件事。
+
+nft 只接受跟在协议匹配之后的端口范围，所以 SNAT 拆成两条：有端口/id/key 的协议带范围，其余协议照旧。DNAT 方向不带范围，与 SONiC 一致。
+
+**范围从 1024 开始**，所以内网主机使用 1024 以下的源端口时会被映射到 1024 以上。这是有意的：全锥会把发往某个已映射外部端口的所有入站转给内网主机，若内网客户端以源端口 500 出站（IPsec IKE），而路由器自己也在 WAN 上跑 IPsec，路由器的 500 端口就会被这条映射占去（按机制推断，未实测）。1024 以上的路由器服务端口（例如 WireGuard 51820）不受这个范围保护。
 
 ## 验证
 
@@ -196,18 +231,24 @@ pystun3   # 或 Windows 上用 NatTypeTester
 # 结果应为 "Full Cone"
 ```
 
+注意：已经建立的连接会沿用开启 fullcone 之前的 NAT 行为，`firewall restart` 不会改变它们。测试前重启路由器最稳妥；在 NSS/ECM 这类把连接交给硬件转发的平台上，清空 conntrack 也撤不掉已经加速的连接。
+
 ## 已知限制
 
 ### fw3 (iptables) 相关
 
 - **fw3 代码只对 IPv4 生成 NAT 规则**：firewall3 的 `zones.c` 里 `print_zone_rule` 在 `FW3_TABLE_NAT` 分支中有 `if (zone->masq && handle->family == FW3_FAMILY_V4)` 判断，IPv6 走不同路径。因此本项目的 fw3 patch 只生成 IPv4 fullcone 规则。
 
-  **手动添加 IPv6 fullcone**：内核侧的 984/985 补丁和 901 用户态补丁都是 IPv4/IPv6 通用的，`FULLCONE` target 对两个协议族都注册了。可以在 `/etc/firewall.user` 里手动加：
+  **手动添加 IPv6 fullcone**：内核侧的 984/985 补丁和 901 用户态补丁都是 IPv4/IPv6 通用的，`FULLCONE` target 对两个协议族都注册了。可以在 `/etc/firewall.user` 里手动加（POSTROUTING 一侧的端口范围原因见下一条）：
 
   ```bash
+  ip6tables -t nat -A POSTROUTING -o wan -p tcp -j FULLCONE --to-ports 1024-65535
+  ip6tables -t nat -A POSTROUTING -o wan -p udp -j FULLCONE --to-ports 1024-65535
   ip6tables -t nat -A POSTROUTING -o wan -j FULLCONE
   ip6tables -t nat -A PREROUTING  -i wan -j FULLCONE
   ```
+
+- **fw3 生成的 FULLCONE 规则没有端口范围**：`-j FULLCONE` 不带 `--to-ports`，内核拿不到 `NF_NAT_RANGE_PROTO_SPECIFIED`，3-tuple 唯一性保证不生效，表现与原因见[为什么 SNAT 规则带端口范围](#为什么-snat-规则带端口范围)。fw4 已修正，fw3 尚未修改（按代码判断，未在 fw3 上实测）。
 
 ### 通用限制
 

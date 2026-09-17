@@ -12,7 +12,7 @@ A port of the [SONiC fullcone NAT kernel patch](https://github.com/sonic-net/son
 
 The kernel patch adds a second hash table inside conntrack (`nat_by_manip_src`), keyed by the **post-translation 3-tuple** (protocol, source IP, source port):
 
-- **SNAT direction**: 3-tuple uniqueness guarantees that the same (proto, src_ip, src_port) is never reused by a different connection — this gives Endpoint-Independent Mapping (EIM).
+- **SNAT direction**: 3-tuple uniqueness guarantees that the same (proto, src_ip, src_port) is never reused by a different connection — this gives Endpoint-Independent Mapping (EIM). **The guarantee only holds when the SNAT rule carries a port range**; the rules fw4 generates do, see [Why SNAT rules carry a port range](#why-snat-rules-carry-a-port-range).
 - **DNAT direction**: reverse lookup — inbound packets find the original internal host through the hash table, providing Endpoint-Independent Filtering (EIF).
 - **Full L4 protocol coverage**: TCP, UDP, ICMP, GRE, SCTP, DCCP, UDPlite.
 - **Zero overhead for non-fullcone traffic**: the fullcone flag is per-rule, not global.
@@ -136,6 +136,18 @@ config zone
     option fullcone '1'           # enable fullcone for this zone
 ```
 
+Generated nftables rules:
+
+```nft
+chain srcnat_wan {
+    meta nfproto ipv4 meta l4proto { tcp, udp, sctp, dccp, udplite, icmp, gre } fullcone to :1024-65535
+    meta nfproto ipv4 fullcone                   # other protocols
+}
+chain dstnat_wan {
+    meta nfproto ipv4 fullcone
+}
+```
+
 **UDP only**:
 
 ```
@@ -150,11 +162,11 @@ Generated nftables rules:
 
 ```nft
 chain srcnat_wan {
-    meta nfproto ipv4 meta l4proto udp fullcone  # UDP → fullcone
-    meta nfproto ipv4 masquerade                 # other → standard masquerade
+    meta nfproto ipv4 meta l4proto udp fullcone to :1024-65535  # UDP → fullcone
+    meta nfproto ipv4 masquerade                                # other → standard masquerade
 }
 chain dstnat_wan {
-    meta nfproto ipv4 meta l4proto udp fullcone  # UDP-only reverse mapping
+    meta nfproto ipv4 meta l4proto udp fullcone                 # UDP-only reverse mapping
 }
 ```
 
@@ -167,7 +179,7 @@ For more complex match conditions, drop a file into `/etc/nftables.d/`:
 table inet fullcone-custom {
     chain srcnat {
         type nat hook postrouting priority srcnat + 1; policy accept;
-        oifname "eth1" ip saddr 192.168.1.0/24 meta l4proto udp fullcone
+        oifname "eth1" ip saddr 192.168.1.0/24 meta l4proto udp fullcone to :1024-65535
     }
     chain dstnat {
         type nat hook prerouting priority dstnat + 1; policy accept;
@@ -176,7 +188,30 @@ table inet fullcone-custom {
 }
 ```
 
-When using custom rules, disable the fw4 fullcone option for that zone to avoid conflicts.
+Notes:
+- When using custom rules, disable the fw4 fullcone option for that zone to avoid conflicts.
+- **The SNAT side must carry a port range** (`to :1024-65535`), or 3-tuple uniqueness is not enforced; see the next section. The DNAT side needs none.
+
+### Why SNAT rules carry a port range
+
+The SNAT rules fw4 generates carry `to :1024-65535` for every protocol that has a port (or an ICMP id, or a GRE key). This is not decoration — **without it, 3-tuple uniqueness is not enforced at all**.
+
+The kernel patch is a faithful port of SONiC's, and its `get_unique_tuple()` checks 3-tuple uniqueness only in the `NF_NAT_RANGE_PROTO_SPECIFIED` branch; when the rule has no port range, a translated port is accepted on an ordinary 5-tuple check. SONiC itself never takes that path: its [natmgr](https://github.com/sonic-net/sonic-swss/blob/master/cfgmgr/natmgr.cpp) only adds `--fullcone` when a port range is configured.
+
+What happens without a port range (two inside hosts, both on local UDP 40000, talking to different destinations):
+
+| | no range | with `to :1024-65535` |
+|---|---|---|
+| host 1 → destination A | external port 40000 | external port 40000 |
+| host 2 → destination B | external port **40000**, shared with host 1 | another port |
+| unknown sender → external port 40000 | delivered to **host 2** | delivered to host 1 |
+| host 1 → destination B | **another port**; the mapping depends on the destination | external port 40000 |
+
+The host that mapped first loses inbound reachability on its own port, and its external port changes with the destination — exactly the two things full cone is meant to prevent.
+
+nft only accepts a port range after a match on a protocol, so SNAT is split into two rules: the protocols with a port, id or key get the range, everything else is as before. DNAT carries no range, as in SONiC.
+
+**The range starts at 1024**, so an inside host using a source port below 1024 is mapped above it. That is deliberate: full cone forwards every inbound packet sent to a mapped external port to the inside host, so if a LAN client goes out from source port 500 (IPsec IKE) while the router itself runs IPsec on the WAN, that mapping takes the router's port 500 (reasoned from the mechanism, not tested). Router services above 1024 (WireGuard's 51820, for example) are not protected by the range.
 
 ## Verification
 
@@ -196,18 +231,24 @@ pystun3   # or NatTypeTester on Windows
 # Expected result: "Full Cone"
 ```
 
+Note: connections that already exist keep the NAT behaviour they started with; `firewall restart` does not change them. Rebooting the router before testing is the safe choice. On platforms that hand connections to hardware forwarding, such as NSS/ECM, flushing conntrack does not remove connections that are already accelerated.
+
 ## Known limitations
 
 ### fw3 (iptables)
 
 - **fw3 only generates IPv4 NAT rules**: in firewall3's `zones.c`, `print_zone_rule` checks `if (zone->masq && handle->family == FW3_FAMILY_V4)` inside the `FW3_TABLE_NAT` branch, and IPv6 takes a different path. As a result, this project's fw3 patch only emits IPv4 fullcone rules.
 
-  **Adding IPv6 fullcone manually**: kernel-side patches 984/985 and the userspace 901 patch are protocol-family agnostic — the `FULLCONE` target is registered for both IPv4 and IPv6. Add the rules in `/etc/firewall.user`:
+  **Adding IPv6 fullcone manually**: kernel-side patches 984/985 and the userspace 901 patch are protocol-family agnostic — the `FULLCONE` target is registered for both IPv4 and IPv6. Add the rules in `/etc/firewall.user` (the port range on the POSTROUTING side is explained in the next item):
 
   ```bash
+  ip6tables -t nat -A POSTROUTING -o wan -p tcp -j FULLCONE --to-ports 1024-65535
+  ip6tables -t nat -A POSTROUTING -o wan -p udp -j FULLCONE --to-ports 1024-65535
   ip6tables -t nat -A POSTROUTING -o wan -j FULLCONE
   ip6tables -t nat -A PREROUTING  -i wan -j FULLCONE
   ```
+
+- **The FULLCONE rules fw3 generates carry no port range**: `-j FULLCONE` is emitted without `--to-ports`, so the kernel never sees `NF_NAT_RANGE_PROTO_SPECIFIED` and 3-tuple uniqueness is not enforced; the behaviour and the reason are in [Why SNAT rules carry a port range](#why-snat-rules-carry-a-port-range). fw4 is fixed; fw3 is not yet (judged from the code, not tested on fw3).
 
 ### General
 

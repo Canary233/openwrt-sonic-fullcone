@@ -229,7 +229,17 @@ iptables -t nat -S | grep FULLCONE                          # fw3
 # 3. 测试 NAT 类型（局域网电脑上）
 pystun3   # 或 Windows 上用 NatTypeTester
 # 结果应为 "Full Cone"
+
+# 4. 测试外部主动发起的 TCP 连接（局域网电脑上运行 Natter）
+python3 natter.py   # 不带参数即测试模式，会打印 Please check [ http://公网IP:端口 ]
+# 输出里 "WAN > 公网IP:端口" 应为 [ OPEN ]（检测服务访问不了时显示 [ UNKNOWN ]）。
+# 更直接的是用局域网外的设备（如关掉 Wi-Fi 的手机）打开这个地址，应能看到 "It works!"
+# 然后在路由器上找外部设备连进来的那条（第一个 src= 是外部设备的地址）：
+grep "dport=端口 " /proc/net/nf_conntrack
+# 应为 ESTABLISHED 且带 [ASSURED]；停在 SYN_SENT 且带 [UNREPLIED] 说明回包没有经过 NAT
 ```
+
+第 3 步只能证明外部主动发来的包进得来：STUN 服务器换一个地址发响应，客户端收到就判定为 Full Cone，并不需要回复。内网主机对外部主动连接的回包有没有被正确转换，要靠第 4 步。TCP 必须完成三次握手，这条路径有问题时连接根本建不起来，WAN 口抓包还能看到源地址是内网 IP 的 SYN+ACK，[#6](https://github.com/mufeng05/openwrt-sonic-fullcone/issues/6) 就是这种情况。第 4 步用到 [Natter](https://github.com/MikeWang000000/Natter)，并要求路由器 WAN 口是公网 IP，或者上级 NAT 也是全锥形。
 
 注意：已经建立的连接会沿用开启 fullcone 之前的 NAT 行为，`firewall restart` 不会改变它们。测试前重启路由器最稳妥；在 NSS/ECM 这类把连接交给硬件转发的平台上，清空 conntrack 也撤不掉已经加速的连接。
 

@@ -229,7 +229,17 @@ iptables -t nat -S | grep FULLCONE                          # fw3
 # 3. Test NAT type from a LAN host
 pystun3   # or NatTypeTester on Windows
 # Expected result: "Full Cone"
+
+# 4. Test a TCP connection opened from outside (run Natter on a LAN host)
+python3 natter.py   # no arguments: test mode, prints Please check [ http://PUBLIC_IP:PORT ]
+# "WAN > PUBLIC_IP:PORT" should read [ OPEN ] ([ UNKNOWN ] if the check service is unreachable).
+# More direct: open that address from outside the LAN (a phone with Wi-Fi off) and expect "It works!"
+# Then, on the router, find the outside device's entry (its first src= is that device):
+grep "dport=PORT " /proc/net/nf_conntrack
+# Expect ESTABLISHED with [ASSURED]; SYN_SENT with [UNREPLIED] means replies were not NATed
 ```
+
+Step 3 only proves that packets sent from outside get in: the STUN server answers from a different address, and the client reports Full Cone as soon as that answer arrives, without replying. Whether the LAN host's replies to a connection opened from outside are translated is what step 4 checks. TCP needs a three-way handshake, so when this path is broken the connection never comes up, and a capture on the WAN shows a SYN+ACK leaving with the LAN source address; that is what [#6](https://github.com/mufeng05/openwrt-sonic-fullcone/issues/6) ran into. Step 4 uses [Natter](https://github.com/MikeWang000000/Natter) and needs a public IP on the router's WAN, or a full-cone NAT upstream.
 
 Note: connections that already exist keep the NAT behaviour they started with; `firewall restart` does not change them. Rebooting the router before testing is the safe choice. On platforms that hand connections to hardware forwarding, such as NSS/ECM, flushing conntrack does not remove connections that are already accelerated.
 

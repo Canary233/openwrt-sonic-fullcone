@@ -42,7 +42,7 @@ From the root of your OpenWrt source tree:
 ./scripts/feeds install -a
 
 # Apply all patches
-curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+curl -sSL https://raw.githubusercontent.com/Canary233/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
 
 # Build
 make menuconfig   # No extra options needed — fullcone is compiled into the existing nft_masq.ko / xt_MASQUERADE.ko

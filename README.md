@@ -42,7 +42,7 @@
 ./scripts/feeds install -a
 
 # 一键应用所有补丁
-curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+curl -sSL https://raw.githubusercontent.com/Canary233/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
 
 # 编译
 make menuconfig   # 无需额外勾选，fullcone 编译进现有 nft_masq.ko / xt_MASQUERADE.ko 模块

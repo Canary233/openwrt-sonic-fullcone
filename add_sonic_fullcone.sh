@@ -2,7 +2,7 @@
 # add_sonic_fullcone.sh — Apply SONiC fullcone NAT patches to OpenWrt source tree
 #
 # Usage:
-#   cd /path/to/openwrt && curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+#   cd /path/to/openwrt && curl -sSL https://raw.githubusercontent.com/Canary233/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
 #
 # Prerequisites:
 #   - OpenWrt source tree with kernel 6.6 / 6.12 / 6.18
@@ -29,7 +29,7 @@ fi
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR"' EXIT
 
-REPO="https://github.com/mufeng05/openwrt-sonic-fullcone"
+REPO="https://github.com/Canary233/openwrt-sonic-fullcone"
 echo "Cloning $REPO ..."
 if ! git clone --depth=1 --single-branch "$REPO" "$TMPDIR/sonic-fullcone" 2>&1; then
     echo "Error: failed to clone $REPO"

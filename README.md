@@ -10,12 +10,13 @@
 
 ### 工作原理
 
-内核补丁在 conntrack 内部增加了第二张哈希表（`nat_by_manip_src`），以**转换后的 3-tuple**（协议、源 IP、源端口）为索引：
+内核补丁在 conntrack 的 NAT 扩展（`struct nf_conn_nat`）里维护第二张哈希表（`nat_by_manip_src`），以**转换后的 3-tuple**（协议、源 IP、源端口）为索引。索引在第一条 fullcone 规则安装时按需分配，并把该 netns 已有的 SNAT 映射补进去；没有 fullcone 规则的配置不会分配这张表，也不会扩大 `struct nf_conn`（保持 248 字节 / 4 个 cacheline）：
 
 - **SNAT 方向**：3-tuple 唯一性保证——同一个 (proto, src_ip, src_port) 不会被不同连接复用，实现端点无关映射（EIM）。**这个保证只在 SNAT 规则带端口范围时生效**，fw4 生成的规则会自动带上，见[为什么 SNAT 规则带端口范围](#为什么-snat-规则带端口范围)
 - **DNAT 方向**：反向查找——入站数据包通过哈希表找到原始内部主机，实现端点无关过滤（EIF）
 - **全 L4 协议支持**：TCP、UDP、ICMP、GRE、SCTP、DCCP、UDPlite
-- **非 fullcone 流量零开销**：fullcone 标志位是 per-rule 的，不是全局的
+- **`masq_src` / `masq_dest` 继续生效**：fullcone 的 srcnat 规则和普通 masquerade 一样带源/目的地址匹配
+- **非 fullcone 流量零开销**：fullcone 标志位是 per-rule 的，索引按需分配；没有 fullcone 规则时不维护第二张表
 
 ### 支持的内核版本
 
@@ -114,6 +115,9 @@ uci set firewall.@zone[1].fullcone='1'
 # 3. 可选：仅对 UDP 启用（推荐用于游戏/P2P）
 uci add_list firewall.@zone[1].fullcone_proto='udp'
 
+# 4. 可选：IPv6 单独关闭 fullcone（默认跟随 fullcone）
+uci set firewall.@zone[1].fullcone6='0'
+
 # 应用
 uci commit firewall
 /etc/init.d/firewall restart
@@ -190,6 +194,7 @@ table inet fullcone-custom {
 
 注意：
 - 使用自定义规则时，应关闭该 zone 的 fw4 fullcone 选项以避免冲突。
+- fw4 生成的 dstnat fullcone 规则排在 `chain-append` 用户规则之后，自定义 dstnat 规则可以覆盖它。
 - **SNAT 一侧务必带端口范围**（`to :1024-65535`），否则 3-tuple 唯一性保证不生效，见下一节。DNAT 一侧不需要。
 
 ### 为什么 SNAT 规则带端口范围

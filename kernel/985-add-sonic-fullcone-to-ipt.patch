@@ -10,10 +10,13 @@ PREROUTING and POSTROUTING hooks:
   - POSTROUTING: masquerade + NF_NAT_RANGE_FULLCONE flag
                  (sets up 3-tuple unique mapping via 984 patch)
   - PREROUTING:  reverse lookup via find_appropriate_dst()
-                 (provides EIF — endpoint-independent filtering)
+                 (provides EIF - endpoint-independent filtering)
+
+The target enables the lazy 3-tuple index (984) from its checkentry
+callback, so the index is only allocated when fullcone is actually used.
 
 This is the iptables equivalent of the fw4 nft_fullcone expression.
-No new kernel module is needed — FULLCONE registers inside the
+No new kernel module is needed - FULLCONE registers inside the
 existing xt_MASQUERADE.ko which is already loaded when fw3 uses NAT.
 
 Usage:
@@ -23,12 +26,12 @@ Usage:
 Requires 984-add-sonic-fullcone-support.patch for the kernel-side
 NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
 ---
- net/netfilter/xt_MASQUERADE.c | 101 ++++++++++++++++++++++++++++++++-
- 1 file changed, 100 insertions(+), 1 deletion(-)
-
+ net/netfilter/xt_MASQUERADE.c | 122 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 121 insertions(+), 1 deletion(-)
+---
 --- a/net/netfilter/xt_MASQUERADE.c
 +++ b/net/netfilter/xt_MASQUERADE.c
-@@ -9,8 +9,10 @@
+@@ -8,8 +8,10 @@
  #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
  #include <linux/module.h>
  #include <linux/netfilter/x_tables.h>
@@ -36,13 +39,13 @@ NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
  #include <net/netfilter/nf_nat.h>
  #include <net/netfilter/nf_nat_masquerade.h>
 +#include <uapi/linux/netfilter/nf_nat.h>
-
+ 
  MODULE_LICENSE("GPL");
  MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
-@@ -72,6 +74,77 @@ static int masquerade_tg6_checkentry(con
+@@ -69,6 +71,94 @@
  }
  #endif
-
+ 
 +/* SONiC fullcone target: allows both PRE- and POST-routing hooks.
 + * POSTROUTING: regular masquerade with NF_NAT_RANGE_FULLCONE flag
 + *              (3-tuple unique mapping via 984 patch).
@@ -78,11 +81,17 @@ NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
 +static int fullcone_tg_check(const struct xt_tgchk_param *par)
 +{
 +	const struct nf_nat_ipv4_multi_range_compat *mr = par->targinfo;
++	int err;
 +
 +	if (mr->rangesize != 1) {
 +		pr_debug("bad rangesize %u\n", mr->rangesize);
 +		return -EINVAL;
 +	}
++
++	err = nf_nat_fullcone_enable(par->net);
++	if (err < 0)
++		return err;
++
 +	return nf_ct_netns_get(par->net, par->family);
 +}
 +
@@ -112,12 +121,23 @@ NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
 +
 +	return nf_nat_setup_info(ct, &range, NF_NAT_MANIP_DST);
 +}
++
++static int fullcone_tg6_check(const struct xt_tgchk_param *par)
++{
++	int err;
++
++	err = nf_nat_fullcone_enable(par->net);
++	if (err < 0)
++		return err;
++
++	return masquerade_tg6_checkentry(par);
++}
 +#endif
 +
  static struct xt_target masquerade_tg_reg[] __read_mostly = {
  	{
  #if IS_ENABLED(CONFIG_IPV6)
-@@ -95,7 +166,33 @@ static struct xt_target masquerade_tg_re
+@@ -92,7 +182,33 @@
  		.checkentry	= masquerade_tg_check,
  		.destroy	= masquerade_tg_destroy,
  		.me		= THIS_MODULE,
@@ -144,11 +164,11 @@ NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
 +		.table		= "nat",
 +		.hooks		= (1 << NF_INET_PRE_ROUTING) |
 +				  (1 << NF_INET_POST_ROUTING),
-+		.checkentry	= masquerade_tg6_checkentry,
++		.checkentry	= fullcone_tg6_check,
 +		.destroy	= masquerade_tg_destroy,
 +		.me		= THIS_MODULE,
 +	},
 +#endif
  };
-
+ 
  static int __init masquerade_tg_init(void)

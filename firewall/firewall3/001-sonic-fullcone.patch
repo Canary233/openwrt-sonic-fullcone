@@ -9,6 +9,12 @@ defaults.fullcone is a global gate.
 Uses native fw3 parse infrastructure (FW3_OPT / FW3_LIST) — no manual
 uci_lookup_option calls. fullcone_proto reuses fw3_parse_protocol.
 
+The PREROUTING reverse-mapping rules do not depend on masq_src/masq_dest,
+so they are emitted once per protocol instead of once per address group
+combination.  POSTROUTING rules still carry the source/destination
+matches and are followed by a MASQUERADE fallback for protocols that are
+not in fullcone_proto.
+
 Requires 984 (kernel NAT core) + 985 (kernel FULLCONE target) +
 901 (iptables userspace FULLCONE target) patches. Uses "FULLCONE"
 target which supports both PREROUTING and POSTROUTING hooks,
@@ -16,12 +22,12 @@ providing full EIM+EIF.
 ---
  defaults.c |  2 ++
  options.h  |  4 +++
- zones.c    | 65 ++++++++++++++++++++++++++++++++++++++++++++++++++----
- 3 files changed, 67 insertions(+), 4 deletions(-)
+ zones.c    | 89 +++++++++++++++++++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 91 insertions(+), 4 deletions(-)
 
 --- a/defaults.c
 +++ b/defaults.c
-@@ -49,6 +49,8 @@ const struct fw3_option fw3_flag_opts[]
+@@ -49,6 +49,8 @@
  	FW3_OPT("synflood_rate",       limit,    defaults, syn_flood_rate),
  	FW3_OPT("synflood_burst",      int,      defaults, syn_flood_rate.burst),
  
@@ -32,7 +38,7 @@ providing full EIM+EIF.
  	FW3_OPT("tcp_window_scaling",  bool,     defaults, tcp_window_scaling),
 --- a/options.h
 +++ b/options.h
-@@ -297,6 +297,7 @@ struct fw3_defaults
+@@ -297,6 +297,7 @@
  	enum fw3_reject_code any_reject_code;
  
  	bool syn_flood;
@@ -40,7 +46,7 @@ providing full EIM+EIF.
  	struct fw3_limit syn_flood_rate;
  
  	bool tcp_syncookies;
-@@ -343,6 +344,9 @@ struct fw3_zone
+@@ -343,6 +344,9 @@
  
  	bool mtu_fix;
  
@@ -52,7 +58,7 @@ providing full EIM+EIF.
  	int log;
 --- a/zones.c
 +++ b/zones.c
-@@ -84,6 +84,9 @@ const struct fw3_option fw3_zone_opts[]
+@@ -84,6 +84,9 @@
  	FW3_OPT("mtu_fix",             bool,     zone,     mtu_fix),
  	FW3_OPT("custom_chains",       bool,     zone,     custom_chains),
  
@@ -62,7 +68,7 @@ providing full EIM+EIF.
  	FW3_OPT("log",                 int,      zone,     log),
  	FW3_OPT("log_limit",           limit,    zone,     log_limit),
  
-@@ -216,6 +219,7 @@ fw3_alloc_zone(void)
+@@ -216,6 +219,7 @@
  	INIT_LIST_HEAD(&zone->masq_src);
  	INIT_LIST_HEAD(&zone->masq_dest);
  	INIT_LIST_HEAD(&zone->cthelpers);
@@ -70,7 +76,7 @@ providing full EIM+EIF.
  
  	INIT_LIST_HEAD(&zone->old_addrs);
  
-@@ -311,6 +315,11 @@ fw3_load_zones(struct fw3_state *state,
+@@ -311,6 +315,11 @@
  		if (zone->masq)
  		{
  			fw3_setbit(zone->flags[0], FW3_FLAG_SNAT);
@@ -82,7 +88,7 @@ providing full EIM+EIF.
  		}
  
  		if (zone->custom_chains)
-@@ -670,6 +679,10 @@ print_zone_rule(struct fw3_ipt_handle *h
+@@ -670,6 +679,10 @@
  	struct fw3_address *msrc;
  	struct fw3_address *mdest;
  	struct fw3_ipt_rule *r;
@@ -93,7 +99,34 @@ providing full EIM+EIF.
  
  	if (!fw3_is_family(zone, handle->family))
  		return;
-@@ -753,10 +766,50 @@ print_zone_rule(struct fw3_ipt_handle *h
+@@ -740,6 +753,26 @@
+ 				mdest->invert = true;
+ 			}
+ 
++			/* The reverse-mapping rules do not depend on the source
++			 * or destination address groups, so emit them once.
++			 */
++			if (has_fc_filter)
++			{
++				list_for_each_entry(proto, &zone->fullcone_proto, list)
++				{
++					r = fw3_ipt_rule_new(handle);
++					fw3_ipt_rule_proto(r, proto);
++					fw3_ipt_rule_target(r, "FULLCONE");
++					fw3_ipt_rule_append(r, "zone_%s_prerouting", zone->name);
++				}
++			}
++			else if (zone_fullcone)
++			{
++				r = fw3_ipt_rule_new(handle);
++				fw3_ipt_rule_target(r, "FULLCONE");
++				fw3_ipt_rule_append(r, "zone_%s_prerouting", zone->name);
++			}
++
+ 			/* emit masquerading entries for non-negated addresses
+ 			   and ensure that both src and dest loops run at least once,
+ 			   even if there are no relevant addresses */
+@@ -753,10 +786,40 @@
  					                    handle->family, false)) || first_dest;
  				     first_dest = false)
  				{
@@ -103,22 +136,16 @@ providing full EIM+EIF.
 -					fw3_ipt_rule_append(r, "zone_%s_postrouting", zone->name);
 +					if (has_fc_filter)
 +					{
-+						/* Per-proto fullcone.
-+						 * Each rule is emitted twice: POSTROUTING (SNAT)
-+						 * and PREROUTING (DNAT reverse mapping for EIF).
++						/* Per-proto fullcone SNAT; the matching
++						 * PREROUTING reverse-mapping rules were
++						 * emitted once above.
 +						 */
 +						list_for_each_entry(proto, &zone->fullcone_proto, list) {
-+							/* POSTROUTING */
 +							r = fw3_ipt_rule_new(handle);
 +							fw3_ipt_rule_src_dest(r, msrc, mdest);
 +							fw3_ipt_rule_proto(r, proto);
 +							fw3_ipt_rule_target(r, "FULLCONE");
 +							fw3_ipt_rule_append(r, "zone_%s_postrouting", zone->name);
-+							/* PREROUTING (reverse mapping, per-proto) */
-+							r = fw3_ipt_rule_new(handle);
-+							fw3_ipt_rule_proto(r, proto);
-+							fw3_ipt_rule_target(r, "FULLCONE");
-+							fw3_ipt_rule_append(r, "zone_%s_prerouting", zone->name);
 +						}
 +						/* Fallback masquerade for non-fullcone traffic */
 +						r = fw3_ipt_rule_new(handle);
@@ -128,14 +155,10 @@ providing full EIM+EIF.
 +					}
 +					else if (zone_fullcone)
 +					{
-+						/* All traffic fullcone: POSTROUTING + PREROUTING */
 +						r = fw3_ipt_rule_new(handle);
 +						fw3_ipt_rule_src_dest(r, msrc, mdest);
 +						fw3_ipt_rule_target(r, "FULLCONE");
 +						fw3_ipt_rule_append(r, "zone_%s_postrouting", zone->name);
-+						r = fw3_ipt_rule_new(handle);
-+						fw3_ipt_rule_target(r, "FULLCONE");
-+						fw3_ipt_rule_append(r, "zone_%s_prerouting", zone->name);
 +					}
 +					else
 +					{

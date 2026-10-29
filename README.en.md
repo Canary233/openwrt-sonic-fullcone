@@ -10,12 +10,13 @@ A port of the [SONiC fullcone NAT kernel patch](https://github.com/sonic-net/son
 
 ### How it works
 
-The kernel patch adds a second hash table inside conntrack (`nat_by_manip_src`), keyed by the **post-translation 3-tuple** (protocol, source IP, source port):
+The kernel patch keeps a second hash table (`nat_by_manip_src`) in the conntrack NAT extension (`struct nf_conn_nat`), keyed by the **post-translation 3-tuple** (protocol, source IP, source port).  The index is allocated lazily when the first fullcone rule is installed and is backfilled with the existing SNAT mappings of that netns; configurations without fullcone rules never allocate the table and `struct nf_conn` stays at 248 bytes / 4 cachelines:
 
 - **SNAT direction**: 3-tuple uniqueness guarantees that the same (proto, src_ip, src_port) is never reused by a different connection — this gives Endpoint-Independent Mapping (EIM). **The guarantee only holds when the SNAT rule carries a port range**; the rules fw4 generates do, see [Why SNAT rules carry a port range](#why-snat-rules-carry-a-port-range).
 - **DNAT direction**: reverse lookup — inbound packets find the original internal host through the hash table, providing Endpoint-Independent Filtering (EIF).
 - **Full L4 protocol coverage**: TCP, UDP, ICMP, GRE, SCTP, DCCP, UDPlite.
-- **Zero overhead for non-fullcone traffic**: the fullcone flag is per-rule, not global.
+- **`masq_src` / `masq_dest` keep working**: fullcone srcnat rules carry the same source/destination matches as regular masquerade rules.
+- **Zero overhead for non-fullcone traffic**: the fullcone flag is per-rule and the index is allocated on demand; no second table is maintained when no fullcone rule exists.
 
 ### Supported kernel versions
 
@@ -190,6 +191,7 @@ table inet fullcone-custom {
 
 Notes:
 - When using custom rules, disable the fw4 fullcone option for that zone to avoid conflicts.
+- fw4 emits its dstnat fullcone rules after the `chain-append` user includes, so custom dstnat rules take precedence.
 - **The SNAT side must carry a port range** (`to :1024-65535`), or 3-tuple uniqueness is not enforced; see the next section. The DNAT side needs none.
 
 ### Why SNAT rules carry a port range

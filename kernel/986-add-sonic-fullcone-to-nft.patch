@@ -10,36 +10,39 @@ module, no extra Kconfig option, no kmod package needed.
 The fullcone expression reuses masq's init/dump functions (attribute
 layout is identical), but has its own validate (allows both prerouting
 and postrouting hooks) and eval (sets NF_NAT_RANGE_FULLCONE and handles
-DNAT reverse mapping on prerouting).
+DNAT reverse mapping on prerouting).  Its init also enables the lazy
+3-tuple index from 984, so the index is only allocated when a fullcone
+rule is actually installed.
 
-Requires 984-add-sonic-fullcone-support.patch for the kernel-side
-NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
-
-The .reduce member is set only when the kernel still provides the
+The expression is registered for the ip, ip6 and inet families, like
+masq.  The .reduce member is set only when the kernel still provides the
 register tracking infrastructure. Upstream commit 6b94d081f81d
 ("netfilter: nf_tables: remove register tracking infrastructure")
 dropped nft_expr_ops->reduce and NFT_REDUCE_READONLY, and it has been
 backported into the 6.6.y, 6.12.y and 6.18.y stable trees, so a
 LINUX_VERSION_CODE test would not work: key off the macro instead.
----
- net/netfilter/nft_masq.c | 122 +++++++++++++++++++++++++++++++++++++++
- 1 file changed, 122 insertions(+)
 
+Requires 984-add-sonic-fullcone-support.patch for the kernel-side
+NF_NAT_RANGE_FULLCONE flag and 3-tuple hash table.
+---
+ net/netfilter/nft_masq.c | 149 +++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 148 insertions(+), 1 deletion(-)
+---
 --- a/net/netfilter/nft_masq.c
 +++ b/net/netfilter/nft_masq.c
-@@ -14,6 +14,8 @@
+@@ -12,6 +12,8 @@
  #include <net/netfilter/nf_tables.h>
  #include <net/netfilter/nf_nat.h>
  #include <net/netfilter/nf_nat_masquerade.h>
 +#include <net/netfilter/nf_conntrack.h>
 +#include <uapi/linux/netfilter/nf_nat.h>
-
+ 
  struct nft_masq {
  	u32			flags;
-@@ -128,6 +130,94 @@ static void nft_masq_eval(const struct n
+@@ -128,6 +130,110 @@
  	}
  }
-
+ 
 +/* SONiC fullcone expression — shares struct/init/dump with masq,
 + * but allows prerouting hook and sets NF_NAT_RANGE_FULLCONE.
 + */
@@ -72,6 +75,22 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
 +	return nft_chain_validate_hooks(ctx->chain,
 +			(1 << NF_INET_PRE_ROUTING) |
 +			(1 << NF_INET_POST_ROUTING));
++}
++
++static int nft_fullcone_init(const struct nft_ctx *ctx,
++			     const struct nft_expr *expr,
++			     const struct nlattr * const tb[])
++{
++	int err;
++
++	/* Lazily allocate the translated-source index and backfill this
++	 * netns before any mapping can be created through this rule.
++	 */
++	err = nf_nat_fullcone_enable(ctx->net);
++	if (err < 0)
++		return err;
++
++	return nft_masq_init(ctx, expr, tb);
 +}
 +
 +static void nft_fullcone_eval(const struct nft_expr *expr,
@@ -131,61 +150,103 @@ LINUX_VERSION_CODE test would not work: key off the macro instead.
  static void
  nft_masq_ipv4_destroy(const struct nft_ctx *ctx, const struct nft_expr *expr)
  {
-@@ -228,6 +318,29 @@ static inline void nft_masq_module_exit_
+@@ -236,6 +342,53 @@
  static inline void nft_masq_module_exit_inet(void) {}
  #endif
-
-+static struct nft_expr_type nft_fullcone_type;
-+static const struct nft_expr_ops nft_fullcone_ops = {
-+	.type		= &nft_fullcone_type,
-+	.size		= NFT_EXPR_SIZE(sizeof(struct nft_masq)),
-+	.eval		= nft_fullcone_eval,
-+	.init		= nft_masq_init,
-+	.destroy	= nft_fullcone_destroy,
-+	.dump		= nft_masq_dump,
-+	.validate	= nft_fullcone_validate,
+ 
 +#ifdef NFT_REDUCE_READONLY
-+	.reduce		= NFT_REDUCE_READONLY,
++#define NFT_FULLCONE_REDUCE	.reduce = NFT_REDUCE_READONLY,
++#else
++#define NFT_FULLCONE_REDUCE
 +#endif
-+};
 +
-+static struct nft_expr_type nft_fullcone_type __read_mostly = {
-+	.family		= NFPROTO_INET,
-+	.name		= "fullcone",
-+	.ops		= &nft_fullcone_ops,
-+	.policy		= nft_fullcone_policy,
-+	.maxattr	= NFTA_FULLCONE_MAX,
-+	.owner		= THIS_MODULE,
-+};
++#define NFT_FULLCONE_OPS(_name, _family)				\
++static struct nft_expr_type nft_fullcone_##_name##_type;		\
++static const struct nft_expr_ops nft_fullcone_##_name##_ops = {		\
++	.type		= &nft_fullcone_##_name##_type,			\
++	.size		= NFT_EXPR_SIZE(sizeof(struct nft_masq)),	\
++	.eval		= nft_fullcone_eval,				\
++	.init		= nft_fullcone_init,				\
++	.destroy	= nft_fullcone_destroy,				\
++	.dump		= nft_masq_dump,				\
++	.validate	= nft_fullcone_validate,			\
++	NFT_FULLCONE_REDUCE						\
++};									\
++static struct nft_expr_type nft_fullcone_##_name##_type __read_mostly = { \
++	.family		= _family,					\
++	.name		= "fullcone",					\
++	.ops		= &nft_fullcone_##_name##_ops,			\
++	.policy		= nft_fullcone_policy,				\
++	.maxattr	= NFTA_FULLCONE_MAX,				\
++	.owner		= THIS_MODULE,					\
++}
++
++NFT_FULLCONE_OPS(ipv4, NFPROTO_IPV4);
++NFT_FULLCONE_OPS(inet, NFPROTO_INET);
++
++#ifdef CONFIG_NF_TABLES_IPV6
++NFT_FULLCONE_OPS(ipv6, NFPROTO_IPV6);
++
++static int nft_fullcone_module_init_ipv6(void)
++{
++	return nft_register_expr(&nft_fullcone_ipv6_type);
++}
++
++static void nft_fullcone_module_exit_ipv6(void)
++{
++	nft_unregister_expr(&nft_fullcone_ipv6_type);
++}
++#else
++static inline int nft_fullcone_module_init_ipv6(void) { return 0; }
++static inline void nft_fullcone_module_exit_ipv6(void) {}
++#endif
 +
  static int __init nft_masq_module_init(void)
  {
  	int ret;
-@@ -249,6 +362,13 @@ static int __init nft_masq_module_init(v
+@@ -265,6 +418,29 @@
  		return ret;
  	}
-
-+	ret = nft_register_expr(&nft_fullcone_type);
-+	if (ret < 0) {
-+		nf_nat_masquerade_inet_unregister_notifiers();
-+		nft_unregister_expr(&nft_masq_ipv4_type);
-+		nft_masq_module_exit_inet();
-+		nft_masq_module_exit_ipv6();
-+	}
+ 
++	ret = nft_register_expr(&nft_fullcone_ipv4_type);
++	if (ret < 0)
++		goto err_fullcone_ipv4;
++
++	ret = nft_register_expr(&nft_fullcone_inet_type);
++	if (ret < 0)
++		goto err_fullcone_inet;
++
++	ret = nft_fullcone_module_init_ipv6();
++	if (ret < 0)
++		goto err_fullcone_ipv6;
++
++	return 0;
++
++err_fullcone_ipv6:
++	nft_unregister_expr(&nft_fullcone_inet_type);
++err_fullcone_inet:
++	nft_unregister_expr(&nft_fullcone_ipv4_type);
++err_fullcone_ipv4:
++	nf_nat_masquerade_inet_unregister_notifiers();
++	nft_unregister_expr(&nft_masq_ipv4_type);
++	nft_masq_module_exit_inet();
++	nft_masq_module_exit_ipv6();
  	return ret;
  }
-
-@@ -257,11 +377,13 @@ static void __exit nft_masq_module_exit(
+ 
+@@ -273,11 +449,15 @@
  	nft_masq_module_exit_ipv6();
  	nft_masq_module_exit_inet();
  	nft_unregister_expr(&nft_masq_ipv4_type);
-+	nft_unregister_expr(&nft_fullcone_type);
++	nft_fullcone_module_exit_ipv6();
++	nft_unregister_expr(&nft_fullcone_inet_type);
++	nft_unregister_expr(&nft_fullcone_ipv4_type);
  	nf_nat_masquerade_inet_unregister_notifiers();
  }
-
+ 
  module_init(nft_masq_module_init);
  module_exit(nft_masq_module_exit);
 +MODULE_ALIAS_NFT_EXPR("fullcone");
-
+ 
  MODULE_LICENSE("GPL");
  MODULE_AUTHOR("Arturo Borrero Gonzalez <arturo@debian.org>");
